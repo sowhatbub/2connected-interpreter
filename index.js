@@ -11,21 +11,27 @@ const client = twilio(
 );
 
 app.post('/bring-in-owner', async (req, res) => {
-  console.log('Request body:', JSON.stringify(req.body));
-  
+  console.log('FULL BODY:', JSON.stringify(req.body, null, 2));
+
   try {
-    const callSid = req.body.call?.twilioCallSid || req.body.callSid;
-    console.log('Call SID:', callSid);
+    const body = req.body;
+    const callSid =
+      body?.message?.call?.twilioCallSid ||
+      body?.call?.twilioCallSid ||
+      body?.twilioCallSid ||
+      body?.callSid;
+
+    console.log('Call SID found:', callSid);
+
+    if (!callSid) {
+      return res.status(400).json({ result: 'No call SID found in request.' });
+    }
 
     await client.calls(callSid).update({
-      twiml: `<Response>
-        <Dial>
-          <Number>${process.env.OWNER_PHONE_NUMBER}</Number>
-        </Dial>
-      </Response>`
+      twiml: `<Response><Dial><Number>${process.env.OWNER_PHONE_NUMBER}</Number></Dial></Response>`
     });
 
-    res.json({ result: 'Business owner is being connected. Please stay on the line.' });
+    res.json({ result: 'Connecting you to the business owner now. Please stay on the line.' });
   } catch (err) {
     console.error('Error:', err.message);
     res.status(500).json({ result: 'Error connecting owner.', error: err.message });
