@@ -11,8 +11,7 @@ const client = twilio(
 );
 
 const GREETER_ASSISTANT_ID = '4cabf84c-2953-4679-b4d4-fc6825edfd0f';
-const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';
-const VAPI_PHONE_NUMBER_ID = 'd8a665e3-604b-401c-9578-033a522f1dbe';
+const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';const VAPI_API_KEY = process.env.VAPI_API_KEY;
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
 
 // Incoming call — respond to Twilio immediately
