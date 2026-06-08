@@ -11,14 +11,13 @@ const client = twilio(
 );
 
 const GREETER_ASSISTANT_ID = '4cabf84c-2953-4679-b4d4-fc6825edfd0f';
-const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';const VAPI_API_KEY = process.env.VAPI_API_KEY;
+const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
 
-// Incoming call — respond to Twilio immediately
 app.post('/incoming', (req, res) => {
   console.log('Incoming call from:', req.body.From);
 
-  // Respond to Twilio immediately with TwiML
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say('Please hold while we connect you.');
   twiml.pause({ length: 30 });
@@ -26,7 +25,6 @@ app.post('/incoming', (req, res) => {
   res.type('text/xml');
   res.send(twiml.toString());
 
-  // Dial Vapi greeter in background after responding
   fetch('https://api.vapi.ai/call/phone', {
     method: 'POST',
     headers: {
@@ -46,7 +44,6 @@ app.post('/incoming', (req, res) => {
   .catch(err => console.error('Vapi error:', err.message));
 });
 
-// Bring in owner
 app.post('/bring-in-owner', async (req, res) => {
   console.log('Bringing in owner');
 
