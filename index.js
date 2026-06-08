@@ -11,34 +11,55 @@ const client = twilio(
 );
 
 app.post('/bring-in-owner', async (req, res) => {
-  console.log('FULL BODY:', JSON.stringify(req.body, null, 2));
+  console.log('BODY:', JSON.stringify(req.body, null, 2));
 
   try {
-    const body = req.body;
-    const callSid =
-      body?.message?.call?.twilioCallSid ||
-      body?.call?.twilioCallSid ||
-      body?.twilioCallSid ||
-      body?.callSid;
+    // Vapi sends the call object inside message
+    const call = req.body?.message?.call || req.body?.call || req.body;
+    const callSid = call?.twilioCallSid || call?.externalId;
 
-    console.log('Call SID found:', callSid);
+    console.log('Call SID:', callSid);
 
-    if (!callSid) {
-      return res.status(400).json({ result: 'No call SID found in request.' });
+    if (callSid) {
+      // Update the existing call to dial owner
+      await client.calls(callSid).update({
+        twiml: `<Response>
+          <Say>Please hold while I connect you.</Say>
+          <Dial>
+            <Number>${process.env.OWNER_PHONE_NUMBER}</Number>
+          </Dial>
+        </Response>`
+      });
+    } else {
+      // No SID found — dial owner as outbound call
+      console.log('No SID — making outbound call to owner');
+      await client.calls.create({
+        to: process.env.OWNER_PHONE_NUMBER,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        twiml: `<Response>
+          <Say>You have a call from 2Connected. 
+          Connecting you now.</Say>
+        </Response>`
+      });
     }
 
-    await client.calls(callSid).update({
-      twiml: `<Response><Dial><Number>${process.env.OWNER_PHONE_NUMBER}</Number></Dial></Response>`
+    res.json({ 
+      result: 'Connecting you to the business owner now. Please stay on the line.' 
     });
 
-    res.json({ result: 'Connecting you to the business owner now. Please stay on the line.' });
   } catch (err) {
     console.error('Error:', err.message);
-    res.status(500).json({ result: 'Error connecting owner.', error: err.message });
+    res.status(500).json({ 
+      result: 'Error connecting.', 
+      error: err.message 
+    });
   }
 });
 
-app.get('/', (req, res) => res.send('2Connected Interpreter Server Running'));
+app.get('/', (req, res) => 
+  res.send('2Connected Interpreter Server Running'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => 
+  console.log(`Server running on port ${PORT}`));
+
