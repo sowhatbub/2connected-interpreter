@@ -15,81 +15,49 @@ const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';
 const VAPI_PHONE_NUMBER_ID = 'd8a665e3-604b-401c-9578-033a522f1dbe';
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
 
-// Incoming call — put caller in conference, dial Vapi greeter in
-app.post('/incoming', async (req, res) => {
-  console.log('Incoming call:', req.body.From);
-  const roomName = '2connected-room';
+// Incoming call — respond to Twilio immediately
+app.post('/incoming', (req, res) => {
+  console.log('Incoming call from:', req.body.From);
 
-  try {
-    // Dial Vapi greeter into the conference room
-    await fetch('https://api.vapi.ai/call/phone', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${VAPI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        assistantId: GREETER_ASSISTANT_ID,
-        phoneNumberId: VAPI_PHONE_NUMBER_ID,
-        customer: {
-          number: process.env.TWILIO_PHONE_NUMBER
-        }
-      })
-    });
-  } catch (err) {
-    console.error('Vapi dial error:', err.message);
-  }
-
-  // Put caller in conference room
+  // Respond to Twilio immediately with TwiML
   const twiml = new twilio.twiml.VoiceResponse();
-  const dial = twiml.dial();
-  dial.conference(roomName, {
-    startConferenceOnEnter: true,
-    endConferenceOnExit: false,
-    beep: false,
-    waitUrl: ''
-  });
+  twiml.say('Please hold while we connect you.');
+  twiml.pause({ length: 30 });
 
   res.type('text/xml');
   res.send(twiml.toString());
+
+  // Dial Vapi greeter in background after responding
+  fetch('https://api.vapi.ai/call/phone', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${VAPI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      assistantId: GREETER_ASSISTANT_ID,
+      phoneNumberId: VAPI_PHONE_NUMBER_ID,
+      customer: {
+        number: req.body.From
+      }
+    })
+  })
+  .then(r => r.json())
+  .then(data => console.log('Vapi response:', JSON.stringify(data)))
+  .catch(err => console.error('Vapi error:', err.message));
 });
 
-// Bring in owner + interpreter
+// Bring in owner
 app.post('/bring-in-owner', async (req, res) => {
-  console.log('Bringing in owner and interpreter');
+  console.log('Bringing in owner');
 
   try {
-    // Dial owner
     await client.calls.create({
       to: process.env.OWNER_PHONE_NUMBER,
       from: process.env.TWILIO_PHONE_NUMBER,
       twiml: `<Response>
         <Say>You have a call from 2Connected.</Say>
-        <Dial>
-          <Conference
-            startConferenceOnEnter="true"
-            endConferenceOnExit="true"
-            beep="false">
-            2connected-room
-          </Conference>
-        </Dial>
       </Response>`
-    });
-
-    // Dial interpreter assistant
-    await fetch('https://api.vapi.ai/call/phone', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${VAPI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        assistantId: INTERPRETER_ASSISTANT_ID,
-        phoneNumberId: VAPI_PHONE_NUMBER_ID,
-        customer: {
-          number: process.env.TWILIO_PHONE_NUMBER
-        }
-      })
     });
 
     res.json({
