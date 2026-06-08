@@ -10,47 +10,20 @@ const client = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-const VAPI_API_KEY = process.env.VAPI_API_KEY;
-const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';
-
 app.post('/bring-in-owner', async (req, res) => {
   console.log('BODY:', JSON.stringify(req.body, null, 2));
 
   try {
-    // Step 1 - Dial the owner via Twilio
     await client.calls.create({
       to: process.env.OWNER_PHONE_NUMBER,
       from: process.env.TWILIO_PHONE_NUMBER,
       twiml: `<Response>
-        <Say>You have a call from 2Connected. 
-        Connecting you now.</Say>
-        <Dial>
-          <Conference startConferenceOnEnter="true" 
-            endConferenceOnExit="true">
-            2connected-room
-          </Conference>
-        </Dial>
+        <Say>You have a call from 2Connected.</Say>
       </Response>`
     });
 
-    // Step 2 - Dial the interpreter assistant via Vapi
-    await fetch('https://api.vapi.ai/call', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${VAPI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        assistantId: INTERPRETER_ASSISTANT_ID,
-        phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-        customer: {
-          number: process.env.TWILIO_PHONE_NUMBER
-        }
-      })
-    });
-
     res.json({ 
-      result: 'Connecting you to the business owner now. Please stay on the line.' 
+      result: 'Connecting you now. Please stay on the line.' 
     });
 
   } catch (err) {
