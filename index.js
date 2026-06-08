@@ -10,38 +10,44 @@ const client = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
+const VAPI_API_KEY = process.env.VAPI_API_KEY;
+const INTERPRETER_ASSISTANT_ID = '47ec4252-6e5d-4320-a61e-8b5f8795a97a';
+
 app.post('/bring-in-owner', async (req, res) => {
   console.log('BODY:', JSON.stringify(req.body, null, 2));
 
   try {
-    // Vapi sends the call object inside message
-    const call = req.body?.message?.call || req.body?.call || req.body;
-    const callSid = call?.twilioCallSid || call?.externalId;
+    // Step 1 - Dial the owner via Twilio
+    await client.calls.create({
+      to: process.env.OWNER_PHONE_NUMBER,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      twiml: `<Response>
+        <Say>You have a call from 2Connected. 
+        Connecting you now.</Say>
+        <Dial>
+          <Conference startConferenceOnEnter="true" 
+            endConferenceOnExit="true">
+            2connected-room
+          </Conference>
+        </Dial>
+      </Response>`
+    });
 
-    console.log('Call SID:', callSid);
-
-    if (callSid) {
-      // Update the existing call to dial owner
-      await client.calls(callSid).update({
-        twiml: `<Response>
-          <Say>Please hold while I connect you.</Say>
-          <Dial>
-            <Number>${process.env.OWNER_PHONE_NUMBER}</Number>
-          </Dial>
-        </Response>`
-      });
-    } else {
-      // No SID found — dial owner as outbound call
-      console.log('No SID — making outbound call to owner');
-      await client.calls.create({
-        to: process.env.OWNER_PHONE_NUMBER,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        twiml: `<Response>
-          <Say>You have a call from 2Connected. 
-          Connecting you now.</Say>
-        </Response>`
-      });
-    }
+    // Step 2 - Dial the interpreter assistant via Vapi
+    await fetch('https://api.vapi.ai/call', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${VAPI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        assistantId: INTERPRETER_ASSISTANT_ID,
+        phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
+        customer: {
+          number: process.env.TWILIO_PHONE_NUMBER
+        }
+      })
+    });
 
     res.json({ 
       result: 'Connecting you to the business owner now. Please stay on the line.' 
@@ -62,4 +68,3 @@ app.get('/', (req, res) =>
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => 
   console.log(`Server running on port ${PORT}`));
-
