@@ -57,7 +57,10 @@ app.post('/incoming', (req, res) => {
       endConferenceOnExit: true,      // caller hangs up → whole call ends
       beep: false,
       statusCallback: `${BASE_URL}/conference-events`,
-      statusCallbackEvent: 'start end join leave',
+      // NOTE: 'start' is intentionally left out — Twilio does not reliably
+      // deliver conference-start events, so we trigger off the first
+      // participant-join instead (see /conference-events below).
+      statusCallbackEvent: 'end join leave',
       statusCallbackMethod: 'POST',
     },
     room
@@ -67,7 +70,11 @@ app.post('/incoming', (req, res) => {
   res.send(twiml.toString());
 });
 
-// ── STEP 2: Conference started → dial the AI interpreter into it ───
+// ── STEP 2: First person joins the room → dial the AI interpreter in ──
+// We trigger off 'participant-join' (not 'conference-start') because
+// Twilio does not reliably deliver the start event. We use the
+// activeConferences map to detect "is this the FIRST join in this
+// room?" — if the room isn't in the map yet, it must be the caller.
 app.post('/conference-events', async (req, res) => {
   res.sendStatus(200); // acknowledge Twilio immediately
 
@@ -76,7 +83,7 @@ app.post('/conference-events', async (req, res) => {
   const conferenceSid = req.body.ConferenceSid;
   console.log(`Conference event: ${event} | room: ${room}`);
 
-  if (event === 'conference-start') {
+  if (event === 'participant-join' && !activeConferences.has(room)) {
     activeConferences.set(room, conferenceSid);
 
     try {
