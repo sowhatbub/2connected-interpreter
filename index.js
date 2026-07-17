@@ -1,65 +1,85 @@
-// 2Connected Interpreter Server — Conference Architecture
+// 2Connected Interpreter Server — Multi-Tenant Conference Architecture
 // Flow:
-//   1. Customer calls your main Twilio number → Twilio hits /incoming
-//   2. We drop the caller into a Twilio Conference room (named after their CallSid)
-//   3. The moment the conference starts, Twilio pings /conference-events
-//   4. We dial the Vapi Interpreter's phone number INTO that same conference
-//      → Vapi answers, the AI joins the room, and stays until the call ends
-//   5. If the AI (via its tool) hits /bring-in-owner, we dial the owner
-//      into the SAME conference room as a third participant
+//   1. A customer calls one of YOUR clients' Twilio numbers → Twilio hits /incoming
+//   2. We look up which CLIENT owns that number in Supabase (business name,
+//      owner phone, interpreter phone)
+//   3. We drop the caller into a Twilio Conference room
+//   4. The moment the conference starts, we dial that CLIENT's interpreter
+//      number into the same room
+//   5. If the AI hits /bring-in-owner, we identify which client this call
+//      belongs to (by matching the Twilio number Vapi saw as the caller)
+//      and dial THAT client's owner number into the same room
 
 const express = require('express');
 const twilio = require('twilio');
+const { createClient } = require('@supabase/supabase-js');
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-const client = twilio(
+const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// ── Environment variables you need set in Railway ──────────────────
-// TWILIO_ACCOUNT_SID        (already have)
-// TWILIO_AUTH_TOKEN         (already have)
-// TWILIO_PHONE_NUMBER       (already have — your main number, E.164 like +12095551234)
-// OWNER_PHONE_NUMBER        (already have — your cell)
-// VAPI_INTERPRETER_NUMBER   (NEW — the phone number assigned to the
-//                            Interpreter assistant in Vapi, E.164 format)
-// BASE_URL                  (NEW — https://2connected-interpreter-production.up.railway.app)
-// ────────────────────────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
-const TWILIO_NUMBER = process.env.TWILIO_PHONE_NUMBER;
-const OWNER_NUMBER = process.env.OWNER_PHONE_NUMBER;
-const INTERPRETER_NUMBER = process.env.VAPI_INTERPRETER_NUMBER;
 const BASE_URL = process.env.BASE_URL;
 
-// Tracks live conferences: room name → Twilio ConferenceSid
-// (In-memory is fine for low call volume; swap for Supabase later if
-// you ever run many simultaneous calls and multiple server instances.)
+// Tracks live conferences: room name → { conferenceSid, client, pending }
+// client = { business_name, twilio_number, owner_number, interpreter_number }
 const activeConferences = new Map();
-let lastConferenceRoom = null;
 
-// ── STEP 1: Customer calls in → put them in a conference room ──────
-app.post('/incoming', (req, res) => {
-  const room = `interp-${req.body.CallSid}`;
-  lastConferenceRoom = room;
-  console.log(`Incoming call from ${req.body.From} → room ${room}`);
+// ── Helper: look up which client owns a given Twilio number ────────
+async function getClientByTwilioNumber(twilioNumber) {
+  const { data, error } = await supabase
+    .from('clients')
+    .select('*')
+    .eq('twilio_number', twilioNumber)
+    .eq('active', true)
+    .single();
+
+  if (error) {
+    console.error(`No client found for ${twilioNumber}:`, error.message);
+    return null;
+  }
+  return data;
+}
+
+// ── STEP 1: Customer calls a client's number → conference room ─────
+app.post('/incoming', async (req, res) => {
+  const calledNumber = req.body.To; // the number the customer dialed
+  console.log(`Incoming call to ${calledNumber} from ${req.body.From}`);
+
+  const client = await getClientByTwilioNumber(calledNumber);
 
   const twiml = new twilio.twiml.VoiceResponse();
+
+  if (!client) {
+    // Number isn't configured for any active client — fail gracefully
+    console.error(`Rejecting call: ${calledNumber} is not a configured client number`);
+    twiml.say('This number is not currently in service. Goodbye.');
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  const room = `interp-${req.body.CallSid}`;
+  console.log(`Routing call to client "${client.business_name}" -> room ${room}`);
+
   twiml.say('Connecting you to your interpreter now.');
 
   const dial = twiml.dial();
   dial.conference(
     {
-      startConferenceOnEnter: true,   // room opens the moment caller joins
-      endConferenceOnExit: true,      // caller hangs up → whole call ends
+      startConferenceOnEnter: true,
+      endConferenceOnExit: true,
       beep: false,
       statusCallback: `${BASE_URL}/conference-events`,
-      // NOTE: 'start' is intentionally left out — Twilio does not reliably
-      // deliver conference-start events, so we trigger off the first
-      // participant-join instead (see /conference-events below).
       statusCallbackEvent: 'end join leave',
       statusCallbackMethod: 'POST',
     },
@@ -68,36 +88,41 @@ app.post('/incoming', (req, res) => {
 
   res.type('text/xml');
   res.send(twiml.toString());
+
+  // Stash the client config against the room immediately so
+  // /conference-events can find it the instant the caller joins.
+  activeConferences.set(room, { conferenceSid: null, client, pending: true });
 });
 
-// ── STEP 2: First person joins the room → dial the AI interpreter in ──
-// We trigger off 'participant-join' (not 'conference-start') because
-// Twilio does not reliably deliver the start event. We use the
-// activeConferences map to detect "is this the FIRST join in this
-// room?" — if the room isn't in the map yet, it must be the caller.
+// ── STEP 2: First person joins the room -> dial that client's AI in ─
 app.post('/conference-events', async (req, res) => {
-  res.sendStatus(200); // acknowledge Twilio immediately
+  res.sendStatus(200);
 
   const event = req.body.StatusCallbackEvent;
   const room = req.body.FriendlyName;
   const conferenceSid = req.body.ConferenceSid;
   console.log(`Conference event: ${event} | room: ${room}`);
 
-  if (event === 'participant-join' && !activeConferences.has(room)) {
-    activeConferences.set(room, conferenceSid);
+  const entry = activeConferences.get(room);
+  if (!entry) {
+    console.error(`No client record found for room ${room} - ignoring event`);
+    return;
+  }
 
+  if (event === 'participant-join' && entry.pending) {
+    entry.conferenceSid = conferenceSid;
+    entry.pending = false;
+
+    const { client } = entry;
     try {
-      // Dial the Vapi Interpreter's phone number INTO this conference.
-      // Vapi auto-answers with the Interpreter assistant, so the AI
-      // becomes a live participant in the same room as the caller.
-      await client.conferences(conferenceSid).participants.create({
-        from: TWILIO_NUMBER,
-        to: INTERPRETER_NUMBER,
+      await twilioClient.conferences(conferenceSid).participants.create({
+        from: client.twilio_number,
+        to: client.interpreter_number,
         earlyMedia: true,
-        endConferenceOnExit: false, // AI leaving shouldn't kill the call
+        endConferenceOnExit: false,
         beep: false,
       });
-      console.log(`AI interpreter dialed into ${room}`);
+      console.log(`AI interpreter dialed into ${room} for "${client.business_name}"`);
     } catch (err) {
       console.error('Failed to add AI interpreter:', err.message);
     }
@@ -105,17 +130,14 @@ app.post('/conference-events', async (req, res) => {
 
   if (event === 'conference-end') {
     activeConferences.delete(room);
-    if (lastConferenceRoom === room) lastConferenceRoom = null;
     console.log(`Conference ${room} ended`);
   }
 });
 
-// ── STEP 3 (optional): AI's tool call brings the owner into the room ─
+// ── STEP 3: AI's tool call brings the right client's owner in ──────
 app.post('/bring-in-owner', async (req, res) => {
   console.log('Bringing in owner');
 
-  // Vapi's newer tool-call format expects results keyed by toolCallId.
-  // We grab it if present and fall back gracefully if not.
   const toolCallId =
     req.body?.message?.toolCalls?.[0]?.id ||
     req.body?.message?.toolCallList?.[0]?.id ||
@@ -129,21 +151,54 @@ app.post('/bring-in-owner', async (req, res) => {
     }
   };
 
-  const room = lastConferenceRoom;
-  const conferenceSid = room ? activeConferences.get(room) : null;
+  // Vapi tells us which number it saw as the caller of this leg -- that's
+  // the client's Twilio number, since we dialed the interpreter using
+  // `from: client.twilio_number`. We use that to find the right room.
+  const seenNumber = req.body?.message?.call?.customer?.number || null;
+  console.log(`bring-in-owner: Vapi reports call.customer.number = ${seenNumber}`);
 
-  if (!conferenceSid) {
+  let matchRoom = null;
+  let matchEntry = null;
+
+  if (seenNumber) {
+    for (const [room, entry] of activeConferences.entries()) {
+      if (entry.client?.twilio_number === seenNumber && !entry.pending) {
+        matchRoom = room;
+        matchEntry = entry;
+        break;
+      }
+    }
+  }
+
+  // Fallback: if we couldn't match by number (e.g. field missing), use
+  // the most recently opened active room as a best-effort guess.
+  if (!matchEntry) {
+    const rooms = [...activeConferences.entries()].filter(([, e]) => !e.pending);
+    if (rooms.length > 0) {
+      [matchRoom, matchEntry] = rooms[rooms.length - 1];
+      console.log(`bring-in-owner: no exact match, falling back to most recent room ${matchRoom}`);
+    }
+  }
+
+  if (!matchEntry) {
     return respond('No active call found to join.', 200);
   }
 
+  const { client, conferenceSid } = matchEntry;
+
   try {
-    await client.conferences(conferenceSid).participants.create({
-      from: TWILIO_NUMBER,
-      to: OWNER_NUMBER,
+    await twilioClient.conferences(conferenceSid).participants.create({
+      from: client.twilio_number,
+      to: client.owner_number,
       earlyMedia: true,
       endConferenceOnExit: false,
-      beep: true, // audible cue that the owner joined
+      beep: true,
+      timeout: 20, // stop ringing after 20s instead of ringing forever
+      statusCallback: `${BASE_URL}/owner-call-status`,
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+      statusCallbackMethod: 'POST',
     });
+    console.log(`Owner dialed into ${matchRoom} for "${client.business_name}"`);
     respond('The owner is being connected now. Please stay on the line.');
   } catch (err) {
     console.error('Error adding owner:', err.message);
@@ -151,8 +206,21 @@ app.post('/bring-in-owner', async (req, res) => {
   }
 });
 
+// ── Visibility: did the owner actually pick up? ─────────────────────
+app.post('/owner-call-status', (req, res) => {
+  const status = req.body.CallStatus;
+  const to = req.body.To;
+  console.log(`Owner call status: ${status} (dialed ${to})`);
+
+  if (status === 'no-answer' || status === 'busy' || status === 'failed') {
+    console.error(`OWNER DID NOT ANSWER (${status}) — caller and AI are still on the line without them.`);
+  }
+
+  res.sendStatus(200);
+});
+
 app.get('/', (req, res) =>
-  res.send('2Connected Interpreter Server Running'));
+  res.send('2Connected Interpreter Server Running (multi-tenant)'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
