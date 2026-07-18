@@ -30,11 +30,8 @@ process.env.SUPABASE_KEY
 
 const BASE_URL = process.env.BASE_URL;
 
-// Tracks live conferences: room name → { conferenceSid, client, pending }
-// client = { business_name, twilio_number, owner_number, interpreter_number }
 const activeConferences = new Map();
 
-// ── Helper: look up which client owns a given Twilio number ────────
 async function getClientByTwilioNumber(twilioNumber) {
 const { data, error } = await supabase
 .from('clients')
@@ -50,11 +47,34 @@ return null;
 return data;
 }
 
-// ── STEP 1: Customer calls a client's number → conference room ─────
+// ── STEP 1: Customer calls a client's number → language menu ───────
 app.post('/incoming', async (req, res) => {
-const calledNumber = req.body.To; // the number the customer dialed
-console.log(`Incoming call to ${calledNumber} from ${req.body.From}`);
+console.log(`Incoming call to ${req.body.To} from ${req.body.From}`);
 
+const twiml = new twilio.twiml.VoiceResponse();
+
+const gather = twiml.gather({
+numDigits: 1,
+timeout: 6,
+action: `${BASE_URL}/language-selected`,
+method: 'POST',
+});
+gather.say('For English, press 1.');
+gather.say({ language: 'es-MX' }, 'Para español, presione 2.');
+
+twiml.redirect({ method: 'POST' }, `${BASE_URL}/language-selected`);
+
+res.type('text/xml');
+res.send(twiml.toString());
+});
+
+// ── STEP 1b: Language chosen (or timed out) → route to conference ──
+app.post('/language-selected', async (req, res) => {
+const digits = req.body.Digits;
+const language = digits === '1' ? 'en' : digits === '2' ? 'es' : 'both';
+console.log(`Language selected: ${digits || 'none pressed'} -> ${language}`);
+
+const calledNumber = req.body.To;
 const client = await getClientByTwilioNumber(calledNumber);
 
 const twiml = new twilio.twiml.VoiceResponse();
@@ -68,9 +88,16 @@ return res.send(twiml.toString());
 }
 
 const room = `interp-${req.body.CallSid}`;
-console.log(`Routing call to client "${client.business_name}" -> room ${room}`);
+console.log(`Routing call to client "${client.business_name}" -> room ${room} (language: ${language})`);
 
+if (language === 'en') {
 twiml.say('Connecting you to your interpreter now.');
+} else if (language === 'es') {
+twiml.say({ language: 'es-MX' }, 'Conectándolo con su intérprete ahora.');
+} else {
+twiml.say('Connecting you to your interpreter now.');
+twiml.say({ language: 'es-MX' }, 'Conectándolo con su intérprete ahora.');
+}
 
 const dial = twiml.dial();
 dial.conference(
@@ -93,6 +120,7 @@ conferenceSid: null,
 client,
 pending: true,
 callerNumber: req.body.From,
+callerLanguage: language,
 logId: null,
 });
 });
@@ -137,6 +165,7 @@ const { data, error } = await supabase
 .insert({
 client_id: client.id,
 caller_number: entry.callerNumber,
+caller_language: entry.callerLanguage || null,
 room,
 started_at: startedAt.toISOString(),
 })
