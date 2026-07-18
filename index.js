@@ -12,17 +12,21 @@
 
 const express = require('express');
 const twilio = require('twilio');
+const cookieParser = require('cookie-parser');
 const { createClient } = require('@supabase/supabase-js');
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+app.use(cookieParser());
 
 const twilioClient = twilio(
 process.env.TWILIO_ACCOUNT_SID,
 process.env.TWILIO_AUTH_TOKEN
 );
 
+// Service-role client — full backend access, bypasses RLS.
+// Used only by the calling engine (/incoming, /bring-in-owner, etc.)
 const supabase = createClient(
 process.env.SUPABASE_URL,
 process.env.SUPABASE_KEY
@@ -30,8 +34,11 @@ process.env.SUPABASE_KEY
 
 const BASE_URL = process.env.BASE_URL;
 
+// Tracks live conferences: room name → { conferenceSid, client, pending }
+// client = { business_name, twilio_number, owner_number, interpreter_number }
 const activeConferences = new Map();
 
+// ── Helper: look up which client owns a given Twilio number ────────
 async function getClientByTwilioNumber(twilioNumber) {
 const { data, error } = await supabase
 .from('clients')
@@ -289,6 +296,333 @@ res.sendStatus(200);
 
 app.get('/', (req, res) =>
 res.send('2Connected Interpreter Server Running (multi-tenant)'));
+
+// ── Internal Dashboard — password-protected, live from Supabase ────
+function escapeHtml(str) {
+if (str == null) return '';
+return String(str)
+.replace(/&/g, '&amp;')
+.replace(/</g, '&lt;')
+.replace(/>/g, '&gt;')
+.replace(/"/g, '&quot;');
+}
+
+function requireDashboardAuth(req, res, next) {
+const expected = process.env.DASHBOARD_PASSWORD;
+if (!expected) {
+return res.status(500).send('DASHBOARD_PASSWORD is not set in Railway variables.');
+}
+const auth = req.headers.authorization;
+if (!auth || !auth.startsWith('Basic ')) {
+res.set('WWW-Authenticate', 'Basic realm="2Connected Dashboard"');
+return res.status(401).send('Authentication required.');
+}
+const decoded = Buffer.from(auth.slice(6), 'base64').toString();
+const password = decoded.split(':')[1];
+if (password !== expected) {
+res.set('WWW-Authenticate', 'Basic realm="2Connected Dashboard"');
+return res.status(401).send('Invalid password.');
+}
+next();
+}
+
+app.get('/dashboard-admin', requireDashboardAuth, async (req, res) => {
+try {
+const { data: clients, error: clientsError } = await supabase
+.from('clients')
+.select('*')
+.order('business_name');
+if (clientsError) throw clientsError;
+
+const startOfMonth = new Date();
+startOfMonth.setDate(1);
+startOfMonth.setHours(0, 0, 0, 0);
+
+const { data: calls, error: callsError } = await supabase
+.from('call_logs')
+.select('*')
+.gte('started_at', startOfMonth.toISOString())
+.order('started_at', { ascending: false });
+if (callsError) throw callsError;
+
+const usageByClient = {};
+for (const call of calls) {
+const cid = call.client_id;
+if (!usageByClient[cid]) usageByClient[cid] = { minutes: 0, calls: 0 };
+usageByClient[cid].minutes += (call.duration_seconds || 0) / 60;
+usageByClient[cid].calls += 1;
+}
+
+const clientRows = clients.map((c) => {
+const usage = usageByClient[c.id] || { minutes: 0, calls: 0 };
+return `<tr>
+<td>${escapeHtml(c.business_name)}</td>
+<td>${escapeHtml(c.twilio_number)}</td>
+<td>${usage.calls}</td>
+<td>${usage.minutes.toFixed(1)}</td>
+<td><span class="status ${c.active ? 'active' : 'inactive'}">${c.active ? 'Active' : 'Inactive'}</span></td>
+</tr>`;
+}).join('');
+
+const callRows = calls.slice(0, 25).map((call) => {
+const client = clients.find((c) => c.id === call.client_id);
+const dur = call.duration_seconds
+? `${Math.floor(call.duration_seconds / 60)}:${String(call.duration_seconds % 60).padStart(2, '0')}`
+: 'in progress';
+return `<tr>
+<td>${new Date(call.started_at).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}</td>
+<td>${escapeHtml(client ? client.business_name : 'Unknown')}</td>
+<td>${escapeHtml(call.caller_number || '—')}</td>
+<td>${escapeHtml(call.caller_language || '—')}</td>
+<td>${dur}</td>
+</tr>`;
+}).join('');
+
+const totalMinutes = Object.values(usageByClient).reduce((sum, u) => sum + u.minutes, 0);
+
+res.send(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>2Connected Dashboard</title>
+<style>
+body { background:#0F1526; color:#F2EFE6; font-family: Arial, sans-serif; margin:0; padding:32px; }
+h1 { font-size:22px; margin-bottom:4px; }
+.sub { color:#8C93B8; margin-bottom:28px; font-size:13px; }
+.stats { display:flex; gap:16px; margin-bottom:32px; flex-wrap:wrap; }
+.stat { background:#19213C; border:1px solid #2B3560; border-radius:10px; padding:16px 20px; min-width:160px; }
+.stat .label { font-size:11px; color:#8C93B8; text-transform:uppercase; letter-spacing:0.05em; }
+.stat .value { font-size:26px; font-weight:700; margin-top:6px; }
+table { width:100%; border-collapse:collapse; background:#19213C; border:1px solid #2B3560; border-radius:10px; overflow:hidden; margin-bottom:32px; }
+th { text-align:left; padding:10px 14px; font-size:11px; text-transform:uppercase; color:#8C93B8; border-bottom:1px solid #2B3560; }
+td { padding:10px 14px; font-size:13px; border-bottom:1px solid #212a4c; }
+tr:last-child td { border-bottom:none; }
+.status { padding:3px 9px; border-radius:20px; font-size:11px; font-weight:600; }
+.status.active { background:#43BFAE22; color:#43BFAE; }
+.status.inactive { background:#E2645C22; color:#E2645C; }
+h2 { font-size:14px; color:#8C93B8; text-transform:uppercase; letter-spacing:0.05em; margin:0 0 12px; }
+</style></head>
+<body>
+<h1>2Connected — Internal Dashboard</h1>
+<div class="sub">${startOfMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</div>
+
+<div class="stats">
+<div class="stat"><div class="label">Active Clients</div><div class="value">${clients.filter((c) => c.active).length}</div></div>
+<div class="stat"><div class="label">Calls This Month</div><div class="value">${calls.length}</div></div>
+<div class="stat"><div class="label">Minutes Used</div><div class="value">${totalMinutes.toFixed(0)}</div></div>
+</div>
+
+<h2>Clients</h2>
+<table>
+<tr><th>Business</th><th>Twilio Number</th><th>Calls</th><th>Minutes</th><th>Status</th></tr>
+${clientRows || '<tr><td colspan="5">No clients yet.</td></tr>'}
+</table>
+
+<h2>Recent Calls</h2>
+<table>
+<tr><th>Time (PT)</th><th>Client</th><th>Caller</th><th>Language</th><th>Duration</th></tr>
+${callRows || '<tr><td colspan="5">No calls yet.</td></tr>'}
+</table>
+</body></html>`);
+} catch (err) {
+console.error('Dashboard error:', err.message);
+res.status(500).send('Error loading dashboard: ' + err.message);
+}
+});
+
+// ══════════════════════════════════════════════════════════════════
+// CLIENT LOGIN + CLIENT-FACING DASHBOARD
+// ══════════════════════════════════════════════════════════════════
+
+function supabaseForUser(accessToken) {
+return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+global: { headers: { Authorization: `Bearer ${accessToken}` } },
+});
+}
+
+const supabaseAnon = createClient(
+process.env.SUPABASE_URL,
+process.env.SUPABASE_ANON_KEY
+);
+
+function loginPage(errorMsg) {
+return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>2Connected — Client Login</title>
+<style>
+body { background:#0F1526; color:#F2EFE6; font-family: Arial, sans-serif;
+display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+.box { background:#19213C; border:1px solid #2B3560; border-radius:12px; padding:40px; width:340px; }
+h1 { font-size:20px; margin:0 0 6px; }
+p.sub { color:#8C93B8; font-size:13px; margin:0 0 28px; }
+label { font-size:12px; color:#8C93B8; display:block; margin-bottom:6px; }
+input { width:100%; padding:10px 12px; margin-bottom:16px; border-radius:8px;
+border:1px solid #2B3560; background:#0F1526; color:#F2EFE6; font-size:14px; box-sizing:border-box; }
+button { width:100%; padding:11px; border:none; border-radius:8px; background:#43BFAE;
+color:#0F1526; font-weight:700; font-size:14px; cursor:pointer; }
+.error { background:#E2645C22; color:#E2645C; padding:10px 12px; border-radius:8px;
+font-size:13px; margin-bottom:16px; }
+</style></head>
+<body>
+<div class="box">
+<h1>2Connected</h1>
+<p class="sub">Client Dashboard Login</p>
+${errorMsg ? `<div class="error">${errorMsg}</div>` : ''}
+<form method="POST" action="/login">
+<label>Email</label>
+<input type="email" name="email" required>
+<label>Password</label>
+<input type="password" name="password" required>
+<button type="submit">Log In</button>
+</form>
+</div>
+</body></html>`;
+}
+
+app.get('/login', (req, res) => {
+res.send(loginPage(null));
+});
+
+app.post('/login', async (req, res) => {
+const { email, password } = req.body;
+const { data, error } = await supabaseAnon.auth.signInWithPassword({ email, password });
+
+if (error || !data.session) {
+console.error('Login failed:', error && error.message);
+return res.send(loginPage('Incorrect email or password.'));
+}
+
+res.cookie('sb_access_token', data.session.access_token, { httpOnly: true, sameSite: 'lax' });
+res.cookie('sb_refresh_token', data.session.refresh_token, { httpOnly: true, sameSite: 'lax' });
+res.redirect('/dashboard');
+});
+
+app.get('/logout', (req, res) => {
+res.clearCookie('sb_access_token');
+res.clearCookie('sb_refresh_token');
+res.redirect('/login');
+});
+
+async function requireClientLogin(req, res, next) {
+const accessToken = req.cookies.sb_access_token;
+const refreshToken = req.cookies.sb_refresh_token;
+
+if (!accessToken) return res.redirect('/login');
+
+let userClient = supabaseForUser(accessToken);
+let { data: userData, error } = await userClient.auth.getUser(accessToken);
+
+if (error || !userData?.user) {
+if (!refreshToken) return res.redirect('/login');
+const { data: refreshed, error: refreshError } = await supabaseAnon.auth.refreshSession({
+refresh_token: refreshToken,
+});
+if (refreshError || !refreshed.session) return res.redirect('/login');
+
+res.cookie('sb_access_token', refreshed.session.access_token, { httpOnly: true, sameSite: 'lax' });
+res.cookie('sb_refresh_token', refreshed.session.refresh_token, { httpOnly: true, sameSite: 'lax' });
+userClient = supabaseForUser(refreshed.session.access_token);
+}
+
+req.userClient = userClient;
+next();
+}
+
+const PLAN_MINUTES = { Starter: 100, Growth: 300, Pro: 750 };
+
+app.get('/dashboard', requireClientLogin, async (req, res) => {
+try {
+const { data: clientRows, error: clientError } = await req.userClient
+.from('clients')
+.select('*')
+.limit(1);
+if (clientError) throw clientError;
+
+if (!clientRows || clientRows.length === 0) {
+return res.send('Your login isn\'t linked to a business yet. Contact 2Connected support.');
+}
+const client = clientRows[0];
+
+const startOfMonth = new Date();
+startOfMonth.setDate(1);
+startOfMonth.setHours(0, 0, 0, 0);
+
+const { data: calls, error: callsError } = await req.userClient
+.from('call_logs')
+.select('*')
+.gte('started_at', startOfMonth.toISOString())
+.order('started_at', { ascending: false });
+if (callsError) throw callsError;
+
+const totalMinutes = calls.reduce((sum, c) => sum + (c.duration_seconds || 0) / 60, 0);
+const includedMinutes = PLAN_MINUTES[client.plan_name] || 100;
+const pctUsed = Math.min(100, Math.round((totalMinutes / includedMinutes) * 100));
+
+const callRows = calls.slice(0, 25).map((call) => {
+const dur = call.duration_seconds
+? `${Math.floor(call.duration_seconds / 60)}:${String(call.duration_seconds % 60).padStart(2, '0')}`
+: 'in progress';
+return `<tr>
+<td>${new Date(call.started_at).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}</td>
+<td>${escapeHtml(call.caller_number || '—')}</td>
+<td>${escapeHtml(call.caller_language || '—')}</td>
+<td>${dur}</td>
+</tr>`;
+}).join('');
+
+res.send(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>2Connected — Dashboard</title>
+<style>
+body { background:#0F1526; color:#F2EFE6; font-family: Arial, sans-serif; margin:0; padding:32px; }
+.top { display:flex; justify-content:space-between; align-items:center; margin-bottom:28px; }
+h1 { font-size:20px; margin:0; }
+.sub { color:#8C93B8; font-size:13px; }
+a.logout { color:#8C93B8; font-size:13px; text-decoration:none; }
+.stats { display:flex; gap:16px; margin-bottom:28px; flex-wrap:wrap; }
+.stat { background:#19213C; border:1px solid #2B3560; border-radius:10px; padding:16px 20px; min-width:170px; }
+.stat .label { font-size:11px; color:#8C93B8; text-transform:uppercase; letter-spacing:0.05em; }
+.stat .value { font-size:26px; font-weight:700; margin-top:6px; }
+.progress-track { height:6px; background:#212a4c; border-radius:3px; margin-top:10px; overflow:hidden; }
+.progress-fill { height:100%; background:#E3A548; }
+table { width:100%; border-collapse:collapse; background:#19213C; border:1px solid #2B3560; border-radius:10px; overflow:hidden; margin-bottom:28px; }
+th { text-align:left; padding:10px 14px; font-size:11px; text-transform:uppercase; color:#8C93B8; border-bottom:1px solid #2B3560; }
+td { padding:10px 14px; font-size:13px; border-bottom:1px solid #212a4c; }
+h2 { font-size:14px; color:#8C93B8; text-transform:uppercase; letter-spacing:0.05em; margin:0 0 12px; }
+.plan-badge { background:#43BFAE22; color:#43BFAE; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; }
+</style></head>
+<body>
+<div class="top">
+<div>
+<h1>${escapeHtml(client.business_name)}</h1>
+<div class="sub">${startOfMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</div>
+</div>
+<a class="logout" href="/logout">Log out</a>
+</div>
+
+<h2>Usage &amp; Minutes</h2>
+<div class="stats">
+<div class="stat"><div class="label">Plan</div><div class="value" style="font-size:18px;"><span class="plan-badge">${escapeHtml(client.plan_name)}</span></div></div>
+<div class="stat"><div class="label">Calls This Month</div><div class="value">${calls.length}</div></div>
+<div class="stat" style="min-width:220px;">
+<div class="label">Minutes Used</div>
+<div class="value">${totalMinutes.toFixed(0)} <span style="font-size:15px;color:#8C93B8;">/ ${includedMinutes}</span></div>
+<div class="progress-track"><div class="progress-fill" style="width:${pctUsed}%"></div></div>
+</div>
+</div>
+
+<h2>Call History</h2>
+<table>
+<tr><th>Time (PT)</th><th>Caller</th><th>Language</th><th>Duration</th></tr>
+${callRows || '<tr><td colspan="4">No calls yet this month.</td></tr>'}
+</table>
+
+<h2>Billing Status</h2>
+<div class="stats">
+<div class="stat"><div class="label">Current Plan</div><div class="value" style="font-size:18px;">${escapeHtml(client.plan_name)}</div></div>
+<div class="stat"><div class="label">Included Minutes</div><div class="value" style="font-size:18px;">${includedMinutes}/mo</div></div>
+</div>
+</body></html>`);
+} catch (err) {
+console.error('Client dashboard error:', err.message);
+res.status(500).send('Error loading dashboard: ' + err.message);
+}
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
